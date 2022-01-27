@@ -1,0 +1,242 @@
+#!/home/galeazz/.local_python/bin/python3
+from __future__ import annotations
+
+import argparse
+import enum
+import importlib
+import json
+import socket
+import ssl
+from contextlib import contextmanager
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Generator, Type, Set
+
+# Couldn't be bothered to write actual helper files
+THIS_MODULE = importlib.import_module(__name__)
+
+# Constants
+UNENCRYPTED_SVR_TCP_PORT = 27993
+ENCRYPTED_SVR_TCP_PORT = 27994
+NORTHEASTERN_USERNAME = "galeaz.z"
+
+
+class Mark(enum.IntEnum):
+    """Marks returned by server, regarding placement of a char within a word"""
+
+    NOT_IN_WORD = 0
+    WRONG_POSITION = 1
+    CORRECT = 2
+
+
+class ServerError(BaseException):
+    """Raised when an error message is received from the remote server"""
+
+    pass
+
+
+@dataclass
+class Message:
+    """A message used in the communication between the client and server"""
+
+    @property
+    def _type(self) -> str:
+        return self.__class__.__name__.lower()
+
+    def serialize(self) -> bytes:
+        data = {"type": self._type, **asdict(self)}
+        return f"{json.dumps(data)}\n".encode(encoding="utf-8")
+
+    @staticmethod
+    def deserialize(raw_res: bytes) -> Type[Message]:
+        json_res: dict = json.loads(raw_res.decode(encoding="utf-8").rstrip())
+        message_type = json_res.pop("type")
+        # A constant mapping of type to message class would be a better and more
+        # straightforward solution but I wanted to try some goofy bullshit
+        message_class: type(Message) = getattr(THIS_MODULE, message_type.capitalize())
+        return message_class(**json_res)
+
+
+@dataclass
+class Hello(Message):
+    """Hello message"""
+
+    northeastern_username: str
+
+
+@dataclass
+class Start(Message):
+    """Start message"""
+
+    id: str
+
+
+@dataclass
+class Guess(Message):
+    """Guess message"""
+
+    id: str
+    word: str
+
+
+@dataclass
+class Retry(Message):
+    """Retry message"""
+
+    id: str
+    guesses: List[Dict]
+
+
+@dataclass
+class Bye(Message):
+    """Bye message"""
+
+    id: str
+    flag: str
+
+
+@dataclass
+class Error(Message):
+    """Error message"""
+
+    message: str
+
+
+def _get_connection_manager(use_ssl: bool):
+    """Returns the appropriate connection manager
+
+    :param use_ssl: If true, use an SSL encrypted connection manager
+
+    :return: A context manager that establishes the server connection
+    """
+    return _encrypted_server_conn if use_ssl else _unencrypted_server_conn
+
+
+@contextmanager
+def _unencrypted_server_conn(hostname: str, port: int) -> Generator[socket.socket]:
+    """Create context for an unencrypted TCP connection"""
+    yield socket.create_connection((hostname, port))
+
+
+@contextmanager
+def _encrypted_server_conn(hostname: str, port: int) -> Generator[socket.socket]:
+    """Create context for an SSL encrypted TCP connection"""
+    ssl_context = ssl.create_default_context()
+    with socket.create_connection((hostname, port)) as sock:
+        yield ssl_context.wrap_socket(sock, server_hostname=hostname)
+
+
+def _get_server_response(sock: socket.socket) -> bytes:
+    """Read socket, buffering the read contents until terminating character is found"""
+    recv_buffer = b""
+    while not recv_buffer.endswith(b"\n"):
+        recv_buffer += sock.recv(2048)
+    return recv_buffer
+
+
+def _start_game(sock: socket.socket, northeastern_username: str) -> str:
+    """Say hi to the server
+
+    :param sock: Connection to use
+    :param northeastern_username: Husky username, e.g. galeaz.z
+
+    :return: The game id
+    """
+    hello_msg = Hello(northeastern_username)
+    sock.sendall(hello_msg.serialize())
+    resp = Message.deserialize(_get_server_response(sock))
+    if not isinstance(resp, Start):
+        raise ValueError(f"Unexpected response from server:\n{resp}:")
+    return resp.id
+
+
+def _update_possible_words(
+    prev_possible_words: Set[str], previous_word: str, previous_marks: List[int]
+) -> Set[str]:
+    """Update pool of possible solutions given most recent guess and the response to it"""
+
+    def is_still_possible_solution(w: str) -> bool:
+        """Determines if a single word could still be a potential solution"""
+        for index, (letter, mark, test_letter) in enumerate(
+            zip(previous_word, previous_marks, w)
+        ):
+            # # a letter of w does not match a correctly guessed letter
+            if mark == Mark.CORRECT and test_letter != letter:
+                return False
+            # w contains a misplaced letter that is in the same incorrect position in previous_word
+            if mark == Mark.WRONG_POSITION and test_letter == letter:
+                return False
+            # w doesn't contain a letter marked as being in the correct word
+            if mark == Mark.WRONG_POSITION and letter not in w:
+                return False
+            # See README for discussion of case where the mark is not in word
+        return True
+
+    return {word for word in prev_possible_words if is_still_possible_solution(word)}
+
+
+def get_secret_flag(
+    hostname: str, port: int, northeastern_username: str, use_ssl: bool
+) -> str:
+    """Return the secret flag by playing wordle with the Khoury server
+
+    :param hostname: The host to play wordle with
+    :param port: The TCP port to connect to on the host
+    :param northeastern_username: Your husky username, e.g. galeaz.z
+    :param use_ssl: If true, wraps the connection with SSL
+
+    :return: The 20-character secret flag won by solving the wordle game
+    """
+    # Load words
+    with open("words.txt", "r") as words_file:
+        all_words: Set[str] = {word.rstrip() for word in words_file.readlines()}
+
+    connection_manager = _get_connection_manager(use_ssl)
+    with connection_manager(hostname, port) as conn:
+        possible_words = all_words.copy()
+        game_id = _start_game(conn, northeastern_username)
+        flag = None
+        while flag is None:
+            new_guess = Guess(game_id, possible_words.pop())
+            conn.sendall(new_guess.serialize())
+            resp = Message.deserialize(_get_server_response(conn))
+            if isinstance(resp, Error):
+                raise ServerError(
+                    f"Encountered the following error from {hostname}:{port} :\n{resp.message}"
+                )
+            if not isinstance(resp, (Retry, Bye)):
+                raise ValueError(
+                    f"Unexpected response from {hostname}:{port} :\n{resp}\n(expected message of type "
+                    "'retry' or 'bye')"
+                )
+            if isinstance(resp, Retry):
+                word, marks = resp.guesses[-1].values()
+                possible_words = _update_possible_words(possible_words, word, marks)
+
+            if isinstance(resp, Bye):
+                flag = resp.flag
+
+    return flag
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("hostname", type=str, help="server hostname")
+    parser.add_argument("username", type=str, help="mynortheastern username")
+    parser.add_argument(
+        "-p", required=False, type=int, help="server port to connect to"
+    )
+    parser.add_argument("-s", required=False, action="store_true")
+    args = parser.parse_args()
+    _hostname = args.hostname
+    _northeastern_username = args.username
+    _port = args.p
+    _use_ssl = args.s
+    if _port is None:
+        _port = ENCRYPTED_SVR_TCP_PORT if _use_ssl else UNENCRYPTED_SVR_TCP_PORT
+    secret = get_secret_flag(
+        hostname=_hostname,
+        port=_port,
+        northeastern_username=_northeastern_username,
+        use_ssl=_use_ssl,
+    )
+    print(secret)
